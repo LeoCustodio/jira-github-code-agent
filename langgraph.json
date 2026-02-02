@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "jira_to_pr": "jira_github_agent.graphs.jira_to_pr_graph:app"
+  },
+  "env": ".env"
+}
