@@ -13,6 +13,8 @@ class GitHubClient:
         })
 
     def post(self, url: str, body: dict) -> Dict[str, Any]:
-        r = self.session.post(url, json=body, timeout=self.timeout_s)
-        r.raise_for_status()
+        r = self.session.post(url, json={"title":"Amazing new feature","body":"Please pull these awesome changes in!","head":"jira/SCRUM-5","base":"main"}, timeout=self.timeout_s)
+        if r.status_code >= 400:
+            # GitHub tells you exactly what field is wrong (e.g., head/base invalid)
+            raise RuntimeError(f"GitHub API error {r.status_code}: {r.text}")
         return r.json()

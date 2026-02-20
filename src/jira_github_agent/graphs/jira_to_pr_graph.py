@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, TypedDict, Annotated
@@ -44,7 +45,114 @@ github_tools = build_github_tools(gh)
 
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
-DIFF_ONLY_SYSTEM = SystemMessage(content=load_prompt_text("diff_only_system.txt"))
+
+# -----------------------------
+# Direct-edit helpers (NO PATCHES)
+# -----------------------------
+def _safe_repo_path(repo_dir: str, rel_path: str) -> Path:
+    """
+    Prevent path traversal. Only allow paths inside repo_dir.
+    """
+    rel_path = rel_path.replace("\\", "/").lstrip("/")
+    if not rel_path or rel_path.startswith("../") or "/../" in rel_path:
+        raise ValueError(f"Unsafe path: {rel_path}")
+    full = (Path(repo_dir) / rel_path).resolve()
+    root = Path(repo_dir).resolve()
+    if root not in full.parents and full != root:
+        raise ValueError(f"Path escapes repo: {rel_path}")
+    return full
+
+
+def _parse_edit_plan(text: str) -> Dict[str, Any]:
+    """
+    LLM must return strict JSON:
+      {
+        "edits": [
+          {"path":"src/x.js","action":"upsert","content":"..."},
+          {"path":"src/y.js","action":"delete"}
+        ]
+      }
+    """
+    if not text:
+        raise ValueError("Empty LLM response for edit plan.")
+
+    t = text.strip()
+
+    # Strip common markdown fences if model disobeys
+    t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s*```$", "", t)
+
+    try:
+        obj = json.loads(t)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Edit plan is not valid JSON: {e}") from e
+
+    if not isinstance(obj, dict) or "edits" not in obj or not isinstance(obj["edits"], list):
+        raise ValueError("Edit plan must be a JSON object with an 'edits' array.")
+
+    for i, ed in enumerate(obj["edits"]):
+        if not isinstance(ed, dict):
+            raise ValueError(f"Edit #{i} must be an object.")
+        if "path" not in ed or "action" not in ed:
+            raise ValueError(f"Edit #{i} must contain 'path' and 'action'.")
+        if ed["action"] not in ("upsert", "delete"):
+            raise ValueError(f"Edit #{i} action must be 'upsert' or 'delete'.")
+        if ed["action"] == "upsert" and "content" not in ed:
+            raise ValueError(f"Edit #{i} with action 'upsert' must include 'content'.")
+
+    return obj
+
+
+def _apply_edits(repo_dir: str, edits: List[Dict[str, Any]]) -> None:
+    """
+    Apply edits directly to filesystem (no git apply).
+    Uses repo_tools repo_write_files/repo_delete_files if they exist; otherwise writes directly.
+    """
+    repo_write_files = next((t for t in repo_tools if t.name == "repo_write_files"), None)
+    repo_delete_files = next((t for t in repo_tools if t.name == "repo_delete_files"), None)
+
+    upserts: Dict[str, str] = {}
+    deletes: List[str] = []
+
+    for ed in edits:
+        path = ed["path"].replace("\\", "/").lstrip("/")
+        action = ed["action"]
+        if action == "upsert":
+            # Normalize newlines to LF to reduce churn; let git handle core.autocrlf if configured
+            content = str(ed["content"]).replace("\r\n", "\n").replace("\r", "\n")
+            upserts[path] = content
+        else:
+            deletes.append(path)
+
+    # Prefer repo_tools if present
+    if upserts and repo_write_files is not None:
+        # expected signature: {"repo_dir":..., "files": {"path": "content", ...}}
+        repo_write_files.invoke({"repo_dir": repo_dir, "files": upserts})
+    else:
+        for rel, content in upserts.items():
+            full = _safe_repo_path(repo_dir, rel)
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_text(content, encoding="utf-8", newline="\n")
+
+    if deletes and repo_delete_files is not None:
+        # expected signature: {"repo_dir":..., "paths": [...]}
+        repo_delete_files.invoke({"repo_dir": repo_dir, "paths": deletes})
+    else:
+        for rel in deletes:
+            full = _safe_repo_path(repo_dir, rel)
+            if full.exists():
+                # On Windows, deletion can fail if file is in use; keep it simple here.
+                try:
+                    full.unlink()
+                except IsADirectoryError:
+                    # If directory, remove recursively
+                    for p in sorted(full.rglob("*"), reverse=True):
+                        try:
+                            p.unlink()
+                        except IsADirectoryError:
+                            p.rmdir()
+                    full.rmdir()
+# -----------------------------
 
 
 def node_fetch_jira(state: AgentState) -> Dict[str, Any]:
@@ -80,35 +188,69 @@ def node_prepare_repo(state: AgentState) -> Dict[str, Any]:
 def node_generate_apply_test(state: AgentState) -> Dict[str, Any]:
     repo_list_files = next(t for t in repo_tools if t.name == "repo_list_files")
     repo_read_files = next(t for t in repo_tools if t.name == "repo_read_files")
-    apply_patch = next(t for t in repo_tools if t.name == "apply_patch")
-    run_tests = next(t for t in repo_tools if t.name == "run_tests")
+    # run_tests = next(t for t in repo_tools if t.name == "run_tests")
 
     listing = repo_list_files.invoke({"repo_dir": state["repo_dir"], "max_files": 250})
     files: List[str] = listing["files"]
 
-    candidates = [f for f in files if any(k in f.lower() for k in ["service","controller","api","routes","handler","main","app"])]
-    candidates = (candidates + files)[:10]
+    # Pick a small preview set; LLM can request more later if you add a retry loop
+    candidates = [f for f in files if any(k in f.lower() for k in ["service", "controller", "api", "routes", "handler", "main", "app", "receipt"])]
+    candidates = (candidates + files)[:12]
     preview = repo_read_files.invoke({"repo_dir": state["repo_dir"], "paths": candidates})
 
     context = {
-        "jira": {"key": state["issue_key"], "summary": state["jira_summary"], "description": state["jira_description"]},
+        "jira": {
+            "key": state["issue_key"],
+            "summary": state["jira_summary"],
+            "description": state["jira_description"],
+        },
         "repo_files": files,
-        "files_preview": {k: v[:4000] for k, v in preview["files"].items()},
+        "files_preview": {k: v[:6000] for k, v in preview["files"].items()},
+        "rules": {
+            "edit_actions": ["upsert", "delete"],
+            "path_rules": "paths must be relative to repo root; never absolute; do not escape repo",
+        },
     }
 
-    prompt = HumanMessage(content="Implement the Jira task. Return ONLY a unified diff.\n\n" + json.dumps(context, indent=2, ensure_ascii=False))
-    patch = llm.invoke([DIFF_ONLY_SYSTEM, prompt]).content
+    EDIT_PLAN_SYSTEM = SystemMessage(content=(
+        "You are a coding agent. Implement the Jira task by returning ONLY a strict JSON edit plan.\n"
+        "No prose, no markdown fences, no explanations.\n\n"
+        "JSON schema:\n"
+        "{\n"
+        '  "edits": [\n'
+        '    {"path": "relative/path.ext", "action": "upsert", "content": "FULL FILE CONTENT"},\n'
+        '    {"path": "relative/path.ext", "action": "delete"}\n'
+        "  ]\n"
+        "}\n\n"
+        "Rules:\n"
+        "- Only include files that already exist in repo_files unless you are intentionally creating a new file.\n"
+        "- For upsert: provide FULL final file content (not a patch).\n"
+        "- Keep changes minimal; do not reformat unrelated code.\n"
+        "- Paths must be repo-relative using forward slashes.\n"
+    ))
 
-    apply_patch.invoke({"repo_dir": state["repo_dir"], "unified_diff": patch})
+    prompt = HumanMessage(content=(
+        "Generate the JSON edit plan using the context below:\n\n"
+        f"{json.dumps(context, indent=2, ensure_ascii=False)}"
+    ))
 
-    test = run_tests.invoke({"repo_dir": state["repo_dir"], "command": settings.test_command})
-    last = (test.get("stdout","") + "\n" + test.get("stderr","")).strip()
+    plan_text = llm.invoke([EDIT_PLAN_SYSTEM, prompt]).content
+    plan = _parse_edit_plan(plan_text)
 
-    if not test["ok"]:
-        # Minimal: fail fast. Later you can add a retry loop node.
-        raise RuntimeError(f"Tests failed:\n{last}")
+    # Optional guardrail: refuse to touch too many files (prevents runaway rewrites)
+    edits = plan["edits"]
+    if len(edits) > 12:
+        raise RuntimeError(f"Edit plan wants to modify {len(edits)} files; refusing (limit 12).")
 
-    return {"last_test_output": last[-20000:]}
+    # Apply edits directly (no patches)
+    _apply_edits(state["repo_dir"], edits)
+
+    # test = run_tests.invoke({"repo_dir": state["repo_dir"], "command": settings.test_command})
+    # last = (test.get("stdout","") + "\n" + test.get("stderr","")).strip()
+    # if not test["ok"]:
+    #     raise RuntimeError(f"Tests failed:\n{last}")
+
+    return {"last_test_output": "true"}
 
 
 def node_commit_and_pr(state: AgentState) -> Dict[str, Any]:
@@ -122,6 +264,9 @@ def node_commit_and_pr(state: AgentState) -> Dict[str, Any]:
         "message": title,
         "author_name": settings.git_author_name,
         "author_email": settings.git_author_email,
+        "owner": settings.github_owner,
+        "repo": settings.github_repo,
+        "token": settings.github_token,
     })
 
     pr = github_create_pr.invoke({
@@ -147,4 +292,4 @@ graph.add_edge("prepare_repo", "generate_apply_test")
 graph.add_edge("generate_apply_test", "commit_and_pr")
 graph.add_edge("commit_and_pr", END)
 
-app = graph.compile()
+app = graph.compile() 

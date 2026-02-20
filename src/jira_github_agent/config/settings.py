@@ -2,11 +2,18 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-
 from dotenv import load_dotenv
 
+from dotenv import load_dotenv
+from pathlib import Path
+
+# Explicitly define the path to your .env file
+# env_path = Path('.') / '.env'
+# load_dotenv(dotenv_path=env_path)
+
+
 def load_env() -> None:
-    load_dotenv()
+    load_dotenv(override=True)
 
 def must_env(name: str) -> str:
     v = os.getenv(name)
